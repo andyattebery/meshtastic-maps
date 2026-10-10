@@ -1,0 +1,28 @@
+{
+  "options": {
+    "paths": {
+      "root": "/data",
+      "fonts": "fonts",
+      "styles": "styles",
+      "mbtiles": "vector"
+    },
+    "minRendererPoolSizes": [14],
+    "maxRendererPoolSizes": [14],
+    "maxScaleFactor": 1,
+    "tileMargin": 0,
+    "serveAllFonts": false,
+    "serveStaticMaps": false
+  },
+  "styles": {
+    "osm-bright": {
+      "style": "osm-bright/style.json",
+      "serve_rendered": true,
+      "serve_data": false
+    }
+  },
+  "data": {
+    "illinois": {
+      "mbtiles": "illinois.mbtiles"
+    }
+  }
+}

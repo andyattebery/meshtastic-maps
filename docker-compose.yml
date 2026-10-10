@@ -1,0 +1,29 @@
+# Local raster renderers: the same TileServer GL version Oxed's tile server runs (v5.6.0),
+# drawing Oxed's osm-bright style from vector tiles built by `make vector`.
+# Two instances: one process saturates at ~2 cores; two reach ~710 tiles/s on the M4 Pro and
+# leave the CPU nearly full (scripts/bench_renderers.sh, 2026-10-10).
+x-tileserver: &tileserver
+  image: maptiler/tileserver-gl:v5.6.0@sha256:3a9ccdb24820b6814c8119bcc8a4376c39867cb0ffe69d62919ef898b90c2427
+  command: ["--config", "/data/config.json", "--port", "8080"]
+  volumes:
+    - ./render/config.json:/data/config.json:ro
+    - ./render/styles:/data/styles:ro
+    - ./work/render/fonts:/data/fonts:ro
+    - ./work/vector:/data/vector:ro
+  healthcheck:
+    # rendered TileJSON: exists once the osm-bright raster renderer is loaded (style.json itself
+    # is not published because config.json sets serve_data: false)
+    test: ["CMD", "node", "-e", "require('http').get('http://localhost:8080/styles/osm-bright.json', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+    interval: 5s
+    timeout: 5s
+    retries: 60
+
+services:
+  tileserver:
+    <<: *tileserver
+    ports:
+      - "127.0.0.1:8080:8080"
+  tileserver-b:
+    <<: *tileserver
+    ports:
+      - "127.0.0.1:8081:8080"
