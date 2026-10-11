@@ -10,12 +10,20 @@
 # `make plan` shows what this derives to (layers, tile counts, Planetiler bounds, probes) without
 # fetching any tiles. Changing a tier means starting a new tile database (README, "Changing the map areas").
 
-# OpenStreetMap extract for the local renderer: must contain the whole of every rendered tile, including
-# the parts of border tiles in neighbouring areas (`plan` checks this against a Geofabrik extract's .poly)
+# Free space on the formatted card, in bytes; with several cards, the smallest. After formatting it
+# (README, "Card"): diskutil info /Volumes/MESHMAP | grep "Free Space". Cards sold as the same size
+# differ: this build's two "64 GB" cards are 64.0 and 62.5 GB. This value is card 2's raw size
+# (62,534,975,488 B) minus the 38.8 MB exFAT took on card 1: an estimate, not a measurement.
+card_free_bytes = 62_496_178_176
+
+# Optional: the OpenStreetMap extract the local renderer draws from. Left out, `plan` picks the smallest
+# Geofabrik extract that contains the whole of every rendered tile (border tiles reach into neighbouring
+# areas); given, `plan` checks that against a Geofabrik extract's .poly boundary.
 osm_extract = "https://download.geofabrik.de/north-america/us-latest.osm.pbf"
 
-# places `verify` checks in the finished archive: present at `zoom`, missing at zoom + 1.
-# `plan` checks them against the derived tiles first, and adds one sampled point per tier.
+# Optional: places `verify` checks in the finished archive, present at `zoom` and missing at zoom + 1.
+# These are this build's; replace or delete them for other areas. `plan` checks them against the derived
+# tiles first, and adds one sampled point per tier either way.
 probes = [
   { name = "Denver", lon = -104.9903, lat = 39.7392, zoom = 15 },
   { name = "Anchorage", lon = -149.9003, lat = 61.2181, zoom = 13 },  # Alaska has no state bundle

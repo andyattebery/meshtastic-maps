@@ -17,7 +17,9 @@ The payload is **57.00 GB**: 14,968,630 tiles, 11,860,774 of them unique. A 64 G
 **Why these depths:**
 - **z18 is the top.** Overzoomed tiles were compared at z15–z20. z19 and z20 show the same features as z18, only larger.
 - **US z15.** The bundles stop at z15, so z16 would have to be rendered for the whole country. Most z15 bytes are rural: in Kansas, tiles over 8 KB are 3% of tiles but 16% of bytes. Built-up-only z15 saves space nothing else could use, and it leaves the countryside blank past z14.
-- **Illinois z16, metro z17–18.** These fill the remaining space. Downstate z17 (~5 GB) would push the archive over a 64 GB card's budget, and it would mostly add house numbers on farmland.
+- **Illinois z16, metro z17–18.** These fill the remaining space.
+  - Downstate z17 was left out: it would mostly add house numbers on farmland.
+  - Size alone doesn't rule it out. `make plan` estimates it at +4.87 GB, with the uncertainty band straddling the smaller card's budget (≈62.0 GB; the archive leaves ≈5 GB): "may not fit". Only a build would tell.
 
 What each level shows in osm-bright, checked by eye on sampled tiles:
 
@@ -29,6 +31,29 @@ What each level shows in osm-bright, checked by eye on sampled tiles:
 | z16 | Most streets named; one-way arrows |
 | z17 | House numbers, where OSM has addresses |
 | z18 | Alleys and address ranges |
+
+## Size estimates
+
+`make plan` estimates rendered zooms without rendering. It works per z15 tile of the tier's area, from that tile's size in the bundle:
+
+| Rendered zoom | Children's bytes ≈ | Largest held-out error |
+|---|---|---|
+| z16 | 2.727 × the z15 tile's bytes | ±5% |
+| z17 | 7.050 × | ±16% |
+| z18 | 16.496 × | ±16% |
+
+- **Floor:** never less than 4^d empty tiles of 103 bytes each, the size of every blank rendered tile. That matters for sea and empty land, whose z15 tiles are ~100 B.
+- **Fit:** on this build's database: 2.27M rendered tiles under 178,984 Illinois z15 tiles.
+- **Held out:** fit on one half, predict the other.
+  - z16: Chicago metro vs the rest of Illinois.
+  - z17–18: metro east vs west of 87.9°W, the only split possible, since z17–18 exist only in the metro.
+  - Out of sample: Providence RI z17/z18 came within −7% and −8%.
+- **Rejected:**
+  - a per-tile constant (50–200% off);
+  - an affine fit (±11%, but with a negative intercept).
+- **Coverage:** no data for bases other than z15 (all-Europe stops at z13, world at z9), so `plan` reports "no estimate" there. It also gives none past z18.
+- **What ±16% is:** the worst error seen on these areas, not a bound. So the build doesn't gate on it: before the fetch, `size-gate` renders a 1% sample into the real database and projects the archive from it. The 95% interval comes from the sample's own spread.
+- **Checked on every build:** the fit gate prints each rendered zoom's estimate next to its stored size.
 
 ## Where tiles come from
 

@@ -12,13 +12,16 @@ then turns it into the PMTiles archive MUI reads from maps/osm-bright/osm-bright
 Normally driven by the Makefile. Sizing and the reasons behind this build's tiers:
 docs/DESIGN.md
 
+    uv run build.py bundles [--at=LON,LAT]   # Oxed's bundles: what a tier's `bundles` can name
     uv run build.py pin                      # pin the bundles areas.toml names (work/bundles.json)
-    uv run build.py plan                     # areas.toml -> layers, tile counts, bounds, probes (work/plan/)
+    uv run build.py plan                     # areas.toml -> layers, sizes vs the card, extract, bounds, probes
+    uv run build.py preflight --heap-gb N    # Docker memory, disk space for this plan
     uv run build.py style                    # vendored upstream style -> local style.json
     uv run build.py parity                   # local renderer vs Oxed's server, pixel diff
-    uv run build.py bench                    # 1% render sample: tiles/s, ETA, sizes
+    uv run build.py bench                    # 1% render sample into a scratch db: tiles/s, ETA, size
+    uv run build.py size-gate                # 1% render sample into the real db: fail if clearly over the card
     uv run build.py fetch [--kind bundle|render] [--layers ...] [--bbox ...] [--sample F]
-    uv run build.py report [--budget-bytes N]
+    uv run build.py report [--fit]
     uv run build.py verify --archive A       # counts + tier-boundary probes
     uv run build.py card --mount /Volumes/X  # copy the archive to a card, check sha256
     uv run build.py calibrate                # our 8-bit tiles vs the bundles' (quantizer check)
@@ -59,6 +62,8 @@ SOURCES = os.path.join(WORK, "bundles.json")
 PLAN_DIR = os.path.join(WORK, "plan")
 PLAN = os.path.join(PLAN_DIR, "plan.json")
 PROBES = os.path.join(PLAN_DIR, "probes.json")
+BUDGET = os.path.join(PLAN_DIR, "budget.txt")
+EXTRACT_BYTES = os.path.join(PLAN_DIR, "extract-bytes.txt")
 DIR_CACHE = os.path.join(WORK, "cache", "dirs")
 DEFAULT_DB = os.path.join(WORK, "tiles.mbtiles")
 GO_PMTILES = os.path.join(WORK, "bin", "go-pmtiles")
@@ -66,6 +71,24 @@ STYLE_DIR = os.path.join("render", "styles", "osm-bright")
 
 # Planetiler bounds: the rendered tiles' extent plus this margin, rounded outwards to 0.05°
 BOUNDS_PAD_KM = 2.0
+
+# Rendered size estimate (docs/DESIGN.md, "Size estimates"; measured on the 2026-10-10 build): a z16-18
+# tile's children total RENDER_RATIO[z] x its z15 bundle tile's bytes, but at least 4^d empty tiles of
+# BLANK_TILE_BYTES each. Largest error on held-out data: RENDER_ERR.
+RENDER_RATIO = {16: 2.727, 17: 7.050, 18: 16.496}
+BLANK_TILE_BYTES = 103
+RENDER_ERR = 0.16
+# render speed of docker-compose.yml's two renderers on an M4 Pro (14 CPUs for Docker)
+RENDER_TILES_PER_S = 710
+# `card` leaves this much of the card free beyond the archive
+CARD_MARGIN = 500_000_000
+# Disk peaks: Planetiler's temp files (its own estimate for the US extract: 60 GB, 4.9x the extract),
+# then tiles DB + convert temp + archive at the end (~190 GB measured: 3.1x a 57 GB payload + the extract)
+PLANETILER_TEMP_PER_EXTRACT = 4.9
+DISK_PER_PAYLOAD = 3.1
+# the size gate renders this fraction of each render layer into the real database before the fetch
+SAMPLE = 0.01
+GEOFABRIK_INDEX = "https://download.geofabrik.de/index-v1.json"
 
 CHUNK_BYTES = 64 << 20
 CHUNK_GAP = 1 << 20
@@ -294,8 +317,10 @@ def load_areas():
 
     if not tiers:
         bad("no [[tier]] tables")
-    if not isinstance(cfg.get("osm_extract"), str):
-        bad("osm_extract (URL of an OpenStreetMap .osm.pbf extract) is missing")
+    if "osm_extract" in cfg and not isinstance(cfg["osm_extract"], str):
+        bad("osm_extract must be the URL of an OpenStreetMap .osm.pbf extract (or leave it out: `plan` picks one)")
+    if not isinstance(cfg.get("card_free_bytes"), int) or cfg["card_free_bytes"] <= CARD_MARGIN:
+        bad("card_free_bytes (the formatted card's free space, in bytes) is missing")
     for i, t in enumerate(tiers):
         name = t.get("name")
         if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
@@ -328,7 +353,7 @@ def load_areas():
 
 def config_sha256(cfg, src):
     """What the plan is derived from: the tiers, the extract and the pins (not probes, not comments)."""
-    return sha256_json({"tier": cfg["tier"], "osm_extract": cfg["osm_extract"],
+    return sha256_json({"tier": cfg["tier"], "osm_extract": cfg.get("osm_extract"),
                         "pins": {s: [b["url"], b.get("group")] for s, b in src.items()}})
 
 
@@ -343,6 +368,13 @@ def resolve_bundles(names, src):
                              % (AREAS, n, SOURCES))
         out += [s for s in slugs if s not in out]
     return out
+
+
+def bundles_at(src, slugs, z):
+    """The tier bundles that supply zoom z: those with the smallest maxZoom that still reach it. For
+    "us-state": the all-US bundle to z13 (it has Alaska, and one copy of each border tile), then the states."""
+    reach = [s for s in slugs if src[s]["minZoom"] <= z <= src[s]["maxZoom"]]
+    return [s for s in reach if src[s]["maxZoom"] == min(src[r]["maxZoom"] for r in reach)]
 
 
 def derive(cfg, src):
@@ -360,10 +392,7 @@ def derive(cfg, src):
     layers = []
     for t in reversed(tiers):
         for z in range(t["zooms"][0], t["zooms"][1] + 1):
-            # per zoom, the bundles with the smallest maxZoom that still reach it: for "us-state", the
-            # all-US bundle to z13 (it has Alaska, and one copy of each border tile), then the states
-            reach = [s for s in t["bundles"] if src[s]["minZoom"] <= z <= src[s]["maxZoom"]]
-            use = [s for s in reach if src[s]["maxZoom"] == min(src[r]["maxZoom"] for r in reach)]
+            use = bundles_at(src, t["bundles"], z)
             if not use:
                 layers.append({"tier": t["name"], "kind": "render", "zooms": [z, z]})
             elif layers and layers[-1]["tier"] == t["name"] and layers[-1].get("bundles") == use:
@@ -492,7 +521,80 @@ def load_poly(url):
     return rings
 
 
-def tiles_outside(rings, z, tiles):
+def head_bytes(url):
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return int(r.headers["Content-Length"])
+
+
+def geofabrik_regions():
+    """Geofabrik's extracts, smallest region first: [(area, id, pbf url, rings, bbox)], from its
+    index-v1.json (cached in work/cache/). area is in square degrees scaled by cos(latitude): for ordering."""
+    path = os.path.join(WORK, "cache", "geofabrik-index-v1.json")
+    if not os.path.exists(path):
+        data = http_get(GEOFABRIK_INDEX)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "wb") as f:
+            f.write(data)
+        os.replace(path + ".tmp", path)
+
+    def ring_area(r):
+        if not r:
+            return 0.0
+        cos = math.cos(math.radians(sum(p[1] for p in r) / len(r)))
+        return abs(sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(r, r[1:] + r[:1]))) / 2 * cos
+
+    out = []
+    for f in json.load(open(path))["features"]:
+        g, props = f.get("geometry"), f["properties"]
+        if not g or "pbf" not in props.get("urls", {}):
+            continue
+        polys = g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]
+        rings = [[(p[0], p[1]) for p in ring] for poly in polys for ring in poly if ring]  # holes too (even-odd)
+        area = sum(ring_area(poly[0]) - sum(ring_area(h) for h in poly[1:]) for poly in polys if poly)
+        if not rings and geofabrik_poly_url(props["urls"]["pbf"]):
+            # 19 regions (us/alabama, japan, ...) have empty coordinates in the index: use their .poly
+            rings = [r for r in load_poly(geofabrik_poly_url(props["urls"]["pbf"])) if r]
+            area = sum(ring_area(r) for r in rings)
+        if not rings:
+            continue
+        lons, lats = [p[0] for r in rings for p in r], [p[1] for r in rings for p in r]
+        out.append((area, props["id"], props["urls"]["pbf"], rings, (min(lons), min(lats), max(lons), max(lats))))
+    return sorted(out, key=lambda r: r[0])
+
+
+def covering_extracts(footprint, extent):
+    """[(id, url)] of the Geofabrik extracts that wholly contain every rendered tile, smallest region first.
+    footprint: {zoom: {(x, y)}}; extent: W, S, E, N of those tiles."""
+    return [(rid, url) for _, rid, url, rings, bb in geofabrik_regions()
+            if bb[0] <= extent[0] and bb[1] <= extent[1] and bb[2] >= extent[2] and bb[3] >= extent[3]
+            and not any(tiles_outside(rings, z, tiles) for z, tiles in footprint.items())]
+
+
+def tiles_outside(rings, z, tiles, coarse=10):
+    """[(x, y)] of the tiles at zoom z that are not wholly inside the polygon. Their z`coarse` parents are
+    checked first: the children of a parent that is wholly inside are too."""
+    if z > coarse:
+        s = z - coarse
+        bad = set(_tiles_outside(rings, coarse, {(x >> s, y >> s) for x, y in tiles}))
+        tiles = [(x, y) for x, y in tiles if (x >> s, y >> s) in bad]
+    return _tiles_outside(rings, z, tiles)
+
+
+def ids_outside(rings, z, ids, coarse=10):
+    """tiles_outside for a sorted array of tile ids at zoom z (a bundle's), decoding only the ids under
+    z`coarse` parents that aren't wholly inside: a parent's Hilbert index is its child's >> 2 per level."""
+    s, base, cbase = 2 * (z - coarse), tz_acc(z), tz_acc(coarse)
+    parents = {id_to_zxy(cbase + d)[1:]: d for d in {(t - base) >> s for t in ids}}
+    out = []
+    for p in _tiles_outside(rings, coarse, parents):
+        d = parents[p]
+        lo, hi = bisect.bisect_left(ids, base + (d << s)), bisect.bisect_left(ids, base + ((d + 1) << s))
+        out += _tiles_outside(rings, z, [id_to_zxy(t)[1:] for t in ids[lo:hi]])
+    return out
+
+
+def _tiles_outside(rings, z, tiles):
     """[(x, y)] of the tiles at zoom z that are not wholly inside the polygon: an edge crosses them, or
     they lie outside it. Edges are taken as straight lines in tile (Mercator) coordinates."""
     n = 1 << z
@@ -534,20 +636,18 @@ def bundle_summary(job):
 
 
 def merge_distinct(parts):
-    """[(ids, sizes)] -> (the distinct ids, their bytes). A tile in several bundles (on a state border)
-    counts once, at its larger size, as the database's UPSERT keeps it."""
+    """[(ids, sizes)] -> (the distinct ids, their sizes). A tile in several bundles (on a state border)
+    is kept once, at its larger size, as the database's UPSERT keeps it."""
     if len(parts) == 1:
-        return parts[0][0], sum(parts[0][1])
-    out, total, last, last_ln = array("Q"), 0, -1, 0
+        return parts[0]
+    out, out_sizes = array("Q"), array("L")
     for t, ln in heapq.merge(*[zip(ids, sizes) for ids, sizes in parts]):
-        if t != last:
+        if out and out[-1] == t:
+            out_sizes[-1] = max(out_sizes[-1], ln)
+        else:
             out.append(t)
-            total += ln
-            last, last_ln = t, ln
-        elif ln > last_ln:
-            total += ln - last_ln
-            last_ln = ln
-    return out, total
+            out_sizes.append(ln)
+    return out, out_sizes
 
 
 def write_if_changed(path, text):
@@ -560,34 +660,88 @@ def write_if_changed(path, text):
     os.replace(path + ".tmp", path)
 
 
+def verdict(exact, estimate, unknown, budget):
+    """Sizes vs the card budget: fits / may not fit / over, from exact bytes plus estimated bytes
+    (+-RENDER_ERR), or unknown when a rendered zoom has no estimate."""
+    if unknown:
+        return "unknown"
+    low, high = exact + estimate * (1 - RENDER_ERR), exact + estimate * (1 + RENDER_ERR)
+    return "fits" if high <= budget else "over" if low > budget else "may not fit"
+
+
 def cmd_plan(args):
-    """Derive layers, tile counts, Planetiler bounds and probes from areas.toml; check them; write work/plan/."""
+    """Derive layers, sizes, the extract, Planetiler bounds and probes from areas.toml; check them; write
+    work/plan/. Sizes are compared with the card but never fail the plan: `size-gate` measures them."""
     cfg, src = load_areas(), load_sources()
     tiers, layers = derive(cfg, src)
-    plan = {"config_sha256": config_sha256(cfg, src), "osm_extract": cfg["osm_extract"],
-            "tiers": tiers, "layers": layers}
+    plan = {"config_sha256": config_sha256(cfg, src), "tiers": tiers, "layers": layers}
+    budget = cfg["card_free_bytes"] - CARD_MARGIN
     if not any(l["kind"] == "render" for l in layers):
         raise SystemExit("%s: no tier goes deeper than its bundles, so there is nothing to render" % AREAS)
 
-    # bundle layers: every tile id, from the bundle directories (cached; no tile data is read)
+    # bundle zooms: every tile id and size, from the bundle directories (cached; no tile data is read)
     jobs = [(l["name"], s, src[s]["url"], *l["zooms"]) for l in layers if l["kind"] == "bundle" for s in l["bundles"]]
     with Pool(min(8, len(jobs))) as pool:
         got = pool.map(bundle_summary, jobs)
-    ids, counts = {}, {}
+    per_zoom = {}  # (slug, z) -> (ids, sizes)
+    for (_, slug, _, zmin, zmax), (_, _, ids, sizes) in zip(jobs, got):
+        for z in range(zmin, zmax + 1):
+            lo, hi = bisect.bisect_left(ids, tz_acc(z)), bisect.bisect_left(ids, tz_acc(z + 1))
+            per_zoom[(slug, z)] = (ids[lo:hi], sizes[lo:hi])
+    merged = {}
+
+    def bundle_zoom(slugs, z):
+        """(distinct ids, sizes) of these bundles' tiles at zoom z"""
+        if (tuple(slugs), z) not in merged:
+            for s in slugs:
+                if (s, z) not in per_zoom:
+                    ents = Bundle(src[s]["url"]).entries(z, z)
+                    per_zoom[(s, z)] = (array("Q", (t for t, _, _ in ents)), array("L", (ln for _, _, ln in ents)))
+            merged[(tuple(slugs), z)] = merge_distinct([per_zoom[(s, z)] for s in slugs])
+        return merged[(tuple(slugs), z)]
+
+    sized = {}
+
+    def zoom_size(t, z):
+        """(tiles, bytes, kind) of tier t's area at zoom z. kind: exact (from bundles), estimate (rendered),
+        or why there is no estimate (bytes None)."""
+        if (t["name"], z) not in sized:
+            use, bz = bundles_at(src, t["bundles"], z), t["base_zoom"]
+            if use:
+                ids, sizes = bundle_zoom(use, z)
+                sized[(t["name"], z)] = (len(ids), sum(sizes), "exact")
+            else:
+                lens = (list(base_tiles(plan, t["name"]).values()) if t["bbox"]
+                        else bundle_zoom(bundles_at(src, t["bundles"], bz), bz)[1])
+                n = len(lens) << 2 * (z - bz) if z >= bz else area_count(plan, t["name"], z)
+                if bz == 15 and z in RENDER_RATIO:
+                    d, r = z - 15, RENDER_RATIO[z]
+                    sized[(t["name"], z)] = (n, round(sum(max(r * ln, 4 ** d * BLANK_TILE_BYTES) for ln in lens)), "estimate")
+                elif bz == 15 and z == 15:  # a bbox tier at its base zoom renders like the bundle tiles (parity)
+                    sized[(t["name"], z)] = (n, sum(lens), "estimate")
+                else:
+                    sized[(t["name"], z)] = (n, None, "no estimate past z18" if z > 18 else
+                                             "no estimate from a z%d base" % bz if bz != 15 else "no estimate below z15")
+        return sized[(t["name"], z)]
+
+    counts = {}
     for layer in layers:
         a, b = layer["zooms"]
-        if layer["kind"] == "bundle":
-            # bundle_bytes: every tile once; the archive also stores identical tiles once, so its payload
-            # comes out a little lower (57.00 GB vs 57.39 GB of tiles in the 2026-10-10 build)
-            ids[layer["name"]], layer["bundle_bytes"] = merge_distinct([g[2:] for g in got if g[0] == layer["name"]])
-            for z in range(a, b + 1):
-                counts[z] = (bisect.bisect_left(ids[layer["name"]], tz_acc(z + 1))
-                             - bisect.bisect_left(ids[layer["name"]], tz_acc(z)))
-        else:
-            layer["base_tiles"] = len(base_tiles(plan, layer["tier"]))
-            counts[a] = area_count(plan, layer["tier"], a)
-        layer["tiles"] = sum(counts[z] for z in range(a, b + 1))
+        t = tier_of(plan, layer["tier"])
+        if layer["kind"] == "render":
+            layer["base_tiles"] = len(base_tiles(plan, t["name"]))
+        zs = [zoom_size(t, z) for z in range(a, b + 1)]
+        counts.update({z: n for z, (n, _, _) in zip(range(a, b + 1), zs)})
+        layer["tiles"] = sum(n for n, _, _ in zs)
+        kinds = [k for _, _, k in zs]
+        layer["size"] = next((k for k in kinds if k not in ("exact", "estimate")), "estimate" if "estimate" in kinds else "exact")
+        layer["bytes"] = sum(by for _, by, _ in zs) if layer["size"] in ("exact", "estimate") else None
     plan["counts"] = {str(z): n for z, n in sorted(counts.items())}
+    exact = sum(l["bytes"] for l in layers if l["size"] == "exact")
+    estimate = sum(l["bytes"] for l in layers if l["size"] == "estimate")
+    unknown = [l["name"] for l in layers if l["bytes"] is None]
+    plan["size"] = {"exact": exact, "estimate": estimate, "unknown": unknown,
+                    "low": round(exact + estimate * (1 - RENDER_ERR)), "high": round(exact + estimate * (1 + RENDER_ERR))}
 
     parents = {}
 
@@ -597,7 +751,7 @@ def cmd_plan(args):
         if layer is None or not (0 <= x < 1 << z and 0 <= y < 1 << z):
             return False
         if layer["kind"] == "bundle":
-            a, tid = ids[layer["name"]], zxy_to_id(z, x, y)
+            a, tid = bundle_zoom(layer["bundles"], z)[0], zxy_to_id(z, x, y)
             i = bisect.bisect_left(a, tid)
             return i < len(a) and a[i] == tid
         bz = tier_of(plan, layer["tier"])["base_zoom"]
@@ -620,16 +774,23 @@ def cmd_plan(args):
             continue
         fz = t["zooms"][0]
         first = next(l for l in layers if l["tier"] == t["name"] and l["zooms"][0] == fz)
-        kids = ([id_to_zxy(tid) for tid in ids[first["name"]][
-                    bisect.bisect_left(ids[first["name"]], tz_acc(fz)):bisect.bisect_left(ids[first["name"]], tz_acc(fz + 1))]]
-                if first["kind"] == "bundle" else area_at(plan, t["name"], fz - 1))
-        tops = {(x >> 1, y >> 1) for _, x, y in kids} if first["kind"] == "bundle" else {(x, y) for _, x, y in kids}
+        if first["kind"] == "bundle":
+            tops = {(x >> 1, y >> 1) for _, x, y in map(id_to_zxy, bundle_zoom(first["bundles"], fz)[0])}
+        else:
+            tops = {(x, y) for _, x, y in area_at(plan, t["name"], fz - 1)}
         gaps = [(x, y) for x, y in tops if not has(fz - 1, x, y)]
         if gaps:
             lon, lat = tile_center(fz - 1, *gaps[0])
             (problems if len(gaps) > len(tops) / 100 else warnings).append(
                 "tier %s: %d of its %d parent tiles at z%d are not in %s, so the map is blank at z%d there "
                 "(e.g. near %.4f,%.4f)" % (t["name"], len(gaps), len(tops), fz - 1, t["outer"], fz - 1, lon, lat))
+
+    rendered = [area_extent(plan, l["tier"], l["zooms"][0]) for l in layers if l["kind"] == "render"]
+    extent = (min(r[0] for r in rendered), min(r[1] for r in rendered),
+              max(r[2] for r in rendered), max(r[3] for r in rendered))
+    plan["render_extent"] = [round(v, 4) for v in extent]
+    plan["bounds"] = [round(v, 2) for v in planetiler_bounds(*extent)]
+
     # the extract must have data under every rendered tile: a tile it covers only partly renders blank
     # where the data stops (seen with a Rhode Island extract: RI's border tiles were empty in Massachusetts)
     footprint = {}
@@ -638,24 +799,77 @@ def cmd_plan(args):
             z, bz = layer["zooms"][0], tier_of(plan, layer["tier"])["base_zoom"]
             footprint.setdefault(min(z, bz), set()).update(
                 base_tiles(plan, layer["tier"]) if z >= bz else {(x, y) for _, x, y in area_at(plan, layer["tier"], z)})
-    poly = geofabrik_poly_url(cfg["osm_extract"])
-    plan["extract_poly"] = poly
-    if poly:
-        rings = load_poly(poly)
-        for z, tiles in sorted(footprint.items()):
-            out = tiles_outside(rings, z, tiles)
-            if out:
-                lon, lat = tile_center(z, *out[0])
-                problems.append("osm_extract doesn't cover the rendered area: %d of the %d rendered z%d tiles are not "
-                                "wholly inside %s (e.g. near %.4f,%.4f). Use a larger extract, one that also covers "
-                                "the neighbours that border tiles reach into." % (len(out), len(tiles), z, poly, lon, lat))
-        coverage = "every rendered tile (%s) is inside %s" % (
-            ", ".join("{:,} z{}".format(len(t), z) for z, t in sorted(footprint.items())), poly)
-    else:
+    given, extract, rings = cfg.get("osm_extract"), None, None
+    if given and not geofabrik_poly_url(given):
+        extract, how = given, "given; not a Geofabrik download, so coverage is not checked"
         warnings.append("extract coverage not checked: osm_extract is not a Geofabrik download, so there is no "
                         ".poly boundary to check the rendered tiles against")
-        coverage = "not checked"
+    elif given:
+        rings = load_poly(geofabrik_poly_url(given))
+        out = [(z, xy) for z, tiles in sorted(footprint.items()) for xy in tiles_outside(rings, z, tiles)]
+        if out:
+            cands = covering_extracts(footprint, extent)
+            lon, lat = tile_center(out[0][0], *out[0][1])
+            problems.append("osm_extract doesn't cover the rendered area: %d rendered tiles are not wholly inside "
+                            "%s (e.g. near %.4f,%.4f). %s" % (len(out), geofabrik_poly_url(given), lon, lat,
+                            "The smallest Geofabrik extract that covers them: %s" % cands[0][1] if cands
+                            else "No single Geofabrik extract covers them."))
+        else:
+            extract, how = given, "given; covers every rendered tile"
+    else:
+        cands = covering_extracts(footprint, extent)
+        if cands:
+            extract, how = cands[0][1], "picked: the smallest Geofabrik extract that covers every rendered tile"
+            rings = load_poly(geofabrik_poly_url(extract))
+        else:
+            problems.append("no single Geofabrik extract covers every rendered tile: set osm_extract (coverage of "
+                            "a non-Geofabrik extract is not checked)")
+    plan["osm_extract"] = extract
+    extract_bytes = None
+    if extract:
+        try:
+            extract_bytes = head_bytes(extract)
+        except (urllib.error.URLError, OSError) as e:
+            warnings.append("couldn't get the extract's size (%s); `make` needs it for the disk check" % e)
+
+    # one zoom deeper / shallower per tier: what each costs, and whether the result fits the card
+    whatif = []
+    for i, t in enumerate(tiers):
+        m, inner, outer = t["zooms"][1], tiers[i - 1] if i else None, tiers[i + 1] if i + 1 < len(tiers) else None
+        row = []
+        for zoom, gain, lose, blocker in ((m + 1, t, inner, inner if inner and m + 1 >= inner["zooms"][1] else None),
+                                          (m - 1, inner, t, outer if outer and m - 1 <= outer["zooms"][1] else None)):
+            if blocker or zoom < 0:
+                row.append("n/a: %s is z%d" % (blocker["name"], blocker["zooms"][1]) if blocker else "n/a")
+                continue
+            z = max(zoom, m)  # the zoom that changes hands: m+1 when deeper, m when shallower
+            parts = [(+1, zoom_size(gain, z)) if gain else None, (-1, zoom_size(lose, z)) if lose else None]
+            reason = next((s[2] for p in parts if p for s in [p[1]] if s[1] is None), None)
+            if reason:
+                row.append("z%d: %s" % (zoom, reason))
+                continue
+            d_exact = sum(sign * s[1] for p in parts if p for sign, s in [p] if s[2] == "exact")
+            d_est = sum(sign * s[1] for p in parts if p for sign, s in [p] if s[2] == "estimate")
+            v = verdict(exact + d_exact, estimate + d_est, unknown, budget)
+            flag = ""
+            if rings and zoom > m and zoom_size(t, zoom)[2] == "estimate" and not any(
+                    l["tier"] == t["name"] and l["kind"] == "render" for l in layers):
+                # t starts rendering: its base must be inside the extract too
+                bz = t["base_zoom"]
+                outside = (tiles_outside(rings, bz, base_tiles(plan, t["name"])) if t["bbox"]
+                           else ids_outside(rings, bz, bundle_zoom(bundles_at(src, t["bundles"], bz), bz)[0]))
+                flag = ", beyond the extract" if outside else ""
+            row.append("z%d: %+.2f GB%s -> %s%s" % (zoom, (d_exact + d_est) / 1e9, " ≈" if d_est else "", v, flag))
+        whatif.append((t["name"], m, row))
+
+    inner = tiers[0]
+    c = area_extent(plan, inner["name"], inner["zooms"][0])
+    plan["metadata"] = {"name": "osm-bright: " + ", ".join("%s z%d" % (t["name"], t["zooms"][1]) for t in tiers),
+                        "center": "%.4f,%.4f,%d" % ((c[0] + c[2]) / 2, (c[1] + c[3]) / 2, inner["zooms"][0])}
     plan["warnings"] = warnings
+    plan["layers_sha256"] = sha256_json({"tiers": tiers, "layers": [{k: l.get(k) for k in ("name", "kind", "zooms", "bundles")}
+                                                                    for l in layers],
+                                         "pins": {s: src[s]["url"] for t in tiers for s in t["bundles"]}})
 
     # probes: the ones in areas.toml, then a sampled point per tier (inside it, present at its max_zoom,
     # and with no tile one zoom deeper)
@@ -664,19 +878,19 @@ def cmd_plan(args):
         z = p["zoom"]
         ok = has(z, *lonlat_tile(p["lon"], p["lat"], z)) and not has(z + 1, *lonlat_tile(p["lon"], p["lat"], z + 1))
         deepest = next((d - 1 for d in range(0, 26) if not has(d, *lonlat_tile(p["lon"], p["lat"], d))), None)
-        probes.append(dict(p, ok=ok, note="" if ok else "present down to z%d in this plan" % deepest))
+        probes.append(dict(p, ok=ok, note="" if ok else "present down to z%d in this plan; edit or delete this probe in %s"
+                           % (deepest, AREAS)))
     rnd = random.Random(0)
     for t in tiers:
         m = t["zooms"][1]
         layer = next(l for l in layers if l["tier"] == t["name"] and l["zooms"][0] <= m <= l["zooms"][1])
         if layer["kind"] == "bundle":
-            a = ids[layer["name"]]
-            at_m = (bisect.bisect_left(a, tz_acc(m)), bisect.bisect_left(a, tz_acc(m + 1)))
+            a = bundle_zoom(layer["bundles"], m)[0]
         else:
             keys, bz = list(base_tiles(plan, t["name"])), t["base_zoom"]
         for _ in range(500):
             if layer["kind"] == "bundle":
-                _, x, y = id_to_zxy(a[rnd.randrange(*at_m)])
+                _, x, y = id_to_zxy(a[rnd.randrange(len(a))])
             else:
                 bx, by = keys[rnd.randrange(len(keys))]
                 f = 1 << max(m - bz, 0)
@@ -689,21 +903,9 @@ def cmd_plan(args):
         else:
             problems.append("tier %s: no point found that is present at z%d and missing at z%d" % (t["name"], m, m + 1))
 
-    rendered = [area_extent(plan, l["tier"], l["zooms"][0]) for l in layers if l["kind"] == "render"]
-    extent = (min(r[0] for r in rendered), min(r[1] for r in rendered),
-              max(r[2] for r in rendered), max(r[3] for r in rendered))
-    plan["render_extent"] = [round(v, 4) for v in extent]
-    plan["bounds"] = [round(v, 2) for v in planetiler_bounds(*extent)]
-    inner = tiers[0]
-    c = area_extent(plan, inner["name"], inner["zooms"][0])
-    plan["metadata"] = {"name": "osm-bright: " + ", ".join("%s z%d" % (t["name"], t["zooms"][1]) for t in tiers),
-                        "center": "%.4f,%.4f,%d" % ((c[0] + c[2]) / 2, (c[1] + c[3]) / 2, inner["zooms"][0])}
-    plan["layers_sha256"] = sha256_json({"tiers": tiers, "layers": [{k: l.get(k) for k in ("name", "kind", "zooms", "bundles")}
-                                                                    for l in layers],
-                                         "pins": {s: src[s]["url"] for t in tiers for s in t["bundles"]}})
-
-    row_fmt = "%-22s %-6s %-36s %11s %10s"
-    print(row_fmt % ("layer", "zooms", "source", "tiles", "bundle GB"))
+    gb = lambda v: "%.2f" % (v / 1e9)
+    row_fmt = "%-22s %-6s %-36s %11s %9s"
+    print(row_fmt % ("layer", "zooms", "source", "tiles", "GB"))
     for layer in layers:
         a, b = layer["zooms"]
         if layer["kind"] == "bundle":
@@ -712,14 +914,29 @@ def cmd_plan(args):
         else:
             source = "render from {:,} z{} base tiles".format(layer["base_tiles"], tier_of(plan, layer["tier"])["base_zoom"])
         print(row_fmt % (layer["name"], "%d-%d" % (a, b) if a != b else a, source[:36], "{:,}".format(layer["tiles"]),
-                         "%.2f" % (layer["bundle_bytes"] / 1e9) if "bundle_bytes" in layer else "-"))
+                         "?" if layer["bytes"] is None else ("≈" if layer["size"] == "estimate" else "") + gb(layer["bytes"])))
     print(row_fmt % ("total", "0-%d" % tiers[0]["zooms"][1], "", "{:,}".format(sum(counts.values())),
-                     "%.2f" % (sum(l.get("bundle_bytes", 0) for l in layers) / 1e9)))
-    print("rendered tiles' size: run `make bench` (projects it from a 1% sample)")
+                     ("≈" if estimate else "") + gb(exact + estimate) + ("+?" if unknown else "")))
+    print("\ncard: %s GB free - %s GB margin = %s GB budget" % (gb(cfg["card_free_bytes"]), gb(CARD_MARGIN), gb(budget)))
+    v = verdict(exact, estimate, unknown, budget)
+    print("size: %s GB from bundles (exact) + ≈%s GB rendered (±%d%%) = %s-%s GB -> %s" % (
+        gb(exact), gb(estimate), RENDER_ERR * 100, gb(plan["size"]["low"]), gb(plan["size"]["high"]),
+        {"fits": "fits, at least %s GB spare" % gb(budget - plan["size"]["high"]),
+         "may not fit": "may not fit: `make bench` measures it, and the size gate before the fetch will",
+         "over": "over by at least %s GB: see the shallower options below" % gb(plan["size"]["low"] - budget),
+         "unknown": "unknown: %s has no estimate; `make bench` measures it" % ", ".join(unknown)}[v]))
+    print("\none zoom deeper / shallower per tier (≈: estimated):")
+    for name, m, (deeper, shallower) in whatif:
+        print("  %-16s z%-3d deeper %-44s shallower %s" % (name, m, deeper, shallower))
+    rendered_tiles = sum(l["tiles"] for l in layers if l["kind"] == "render")
+    print("\nosm_extract: %s (%s GB; %s)" % (extract, gb(extract_bytes) if extract_bytes else "size unknown", how)
+          if extract else "\nosm_extract: %s" % ("%s doesn't cover the rendered area (below)" % given if given else "none found"))
+    print("downloads: bundles %s GB + extract %s GB" % (gb(exact), gb(extract_bytes) if extract_bytes else "?"))
+    secs = rendered_tiles / RENDER_TILES_PER_S
+    print("renders {:,} tiles: ~{} at {} tiles/s (two renderers on an M4 Pro; `make bench` measures this machine)".format(
+        rendered_tiles, "%.1f h" % (secs / 3600) if secs >= 3600 else "%.0f min" % max(secs / 60, 1), RENDER_TILES_PER_S))
     print("rendered extent W %.4f / S %.4f / E %.4f / N %.4f; Planetiler bounds %s (+%.0f km, rounded out to 0.05°)" % (
         *extent, ",".join("%.2f" % v for v in plan["bounds"]), BOUNDS_PAD_KM))
-    if not any(p.startswith("osm_extract") for p in problems):
-        print("extract coverage: " + coverage)
     print("probes (present at zoom, missing one deeper):")
     for p in probes:
         print("  %-24s z%-2d %10.5f,%-9.5f %s %s" % (p["name"], p["zoom"], p["lon"], p["lat"], "OK" if p["ok"] else "FAIL", p["note"]))
@@ -735,7 +952,11 @@ def cmd_plan(args):
                                          "probes": [{k: p[k] for k in ("name", "lon", "lat", "zoom")} for p in probes]},
                                         indent=1) + "\n")
     write_if_changed(os.path.join(PLAN_DIR, "bounds.txt"), ",".join("%.2f" % v for v in plan["bounds"]) + "\n")
-    write_if_changed(os.path.join(PLAN_DIR, "osm-url.txt"), plan["osm_extract"] + "\n")
+    write_if_changed(os.path.join(PLAN_DIR, "osm-url.txt"), extract + "\n")
+    # kept out of plan.json: a new card or a new day's extract size re-runs only what compares with them
+    write_if_changed(BUDGET, "%d\n" % budget)
+    if extract_bytes:
+        write_if_changed(EXTRACT_BYTES, "%d\n" % extract_bytes)
     print("plan OK: %s" % PLAN_DIR)
 
 
@@ -792,7 +1013,7 @@ def open_db(path, plan):
     built_for = db.execute("SELECT value FROM metadata WHERE name = 'plan_sha256'").fetchone()
     if built_for and built_for[0] != plan["layers_sha256"] and db.execute("SELECT 1 FROM tiles LIMIT 1").fetchone():
         raise SystemExit("%s holds tiles for a different areas.toml (or bundle pins). Start a new database:\n"
-                         "  rm -f %s*; rm -f work/.bundles.done work/.renders.done work/.tiles.done" % (path, path))
+                         "  rm -f %s*; rm -f work/.size.ok work/.bundles.done work/.renders.done work/.tiles.done" % (path, path))
     meta = {
         "name": plan["metadata"]["name"],
         "format": "png",
@@ -837,43 +1058,31 @@ def log(msg):
 # ---------------------------------------------------------------- commands
 
 def cmd_pin(args):
-    """Pin the bundles areas.toml names. With a pin file already there, keep its pins and only record
-    each bundle's group; --force re-pins everything from Oxed's current metadata."""
+    """Pin the Oxed bundles areas.toml names. A name that already resolves against the pins is left
+    alone, so a resumed build's plan never shifts; others are pinned from Oxed's current metadata (fetched
+    only then, so re-planning works offline). --force re-pins everything."""
     names = sorted({n for t in load_areas()["tier"] for n in t.get("bundles", [])})
+    pinned = {} if args.force or not os.path.exists(SOURCES) else load_sources()
+    missing = [n for n in names if n not in pinned and not any(b.get("group") == n for b in pinned.values())]
+    if not missing:
+        print("pins: every bundle name in %s resolves (%d bundles pinned)" % (AREAS, len(pinned)))
+        return
     meta = json.loads(http_get(METADATA_URL))
     by_slug = {b["slug"]: b for b in meta}
-    want = set()
-    for n in names:
+    new = set()
+    for n in missing:
         members = [n] if n in by_slug else [b["slug"] for b in meta if b["group"] == n]
         if not members:
-            raise SystemExit("%s: %r is not a bundle slug or group in %s" % (AREAS, n, METADATA_URL))
-        want.update(members)
-    if os.path.exists(SOURCES) and not args.force:
-        pinned = load_sources()
-        missing = sorted(want - set(pinned))
-        if missing:
-            raise SystemExit("not pinned: %s. `pin --force` re-pins every bundle from Oxed's current metadata "
-                             "(then start a new database)." % ", ".join(missing))
-        for slug, b in pinned.items():
-            if slug in by_slug:
-                b["group"] = by_slug[slug]["group"]
-        write_if_changed(SOURCES, json.dumps(pinned, indent=1))
-        print("kept %d pinned bundles, built %s; groups recorded" % (
-            len(pinned), ", ".join(sorted({b["createdAt"] for b in pinned.values()}))))
-        return
-    pinned = {}
-    for slug in sorted(want):
+            raise SystemExit("%s: %r is not a bundle slug or group in %s (`make bundles` lists them)" % (AREAS, n, METADATA_URL))
+        new.update(m for m in members if m not in pinned)
+    for slug in sorted(new):
         b = by_slug[slug]
-        req = urllib.request.Request(b["url"], method="HEAD", headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            size = int(r.headers["Content-Length"])
-        if size != b["fileSizeBytes"]:
-            raise SystemExit("%s: Content-Length %d != metadata %d" % (slug, size, b["fileSizeBytes"]))
+        if head_bytes(b["url"]) != b["fileSizeBytes"]:
+            raise SystemExit("%s: the download's size differs from Oxed's metadata (%d B)" % (slug, b["fileSizeBytes"]))
         pinned[slug] = {k: b[k] for k in ("url", "fileSizeBytes", "createdAt", "minZoom", "maxZoom", "bbox", "group")}
-    os.makedirs(WORK, exist_ok=True)
-    with open(SOURCES, "w") as f:
-        json.dump(pinned, f, indent=1)
-    print("pinned %d bundles, built %s" % (len(pinned), ", ".join(sorted({b["createdAt"] for b in pinned.values()}))))
+    write_if_changed(SOURCES, json.dumps(pinned, indent=1))
+    print("pinned %d new bundle%s for %s (built %s); %d pinned in all" % (
+        len(new), "" if len(new) == 1 else "s", ", ".join(missing), ", ".join(sorted({by_slug[s]["createdAt"] for s in new})), len(pinned)))
 
 
 def load_sources():
@@ -913,17 +1122,23 @@ def bundle_layer(db, layer, box):
         log("%-18s %-22s z%d-%d  %9d tiles  %7.1f MB" % (layer["name"], slug, zooms[0], zooms[1], tiles, nbytes / 1e6))
 
 
-def render_layer(db, plan, layer, box, sample, seed, method, url, workers):
-    """Render missing tiles of a layer into db; returns (rendered, failed, bytes, seconds)."""
-    name, z = layer["name"], layer["zooms"][0]
-    targets = area_at(plan, layer["tier"], z)
-    if not box and not sample:  # the full layer: `status` reports progress against this
-        db.execute("INSERT OR REPLACE INTO targets VALUES (?, ?, ?)", (name, z, len(targets)))
-        db.commit()
+def layer_targets(plan, layer, box, sample, seed):
+    """The tiles of a render layer, optionally only those touching box, or a seeded random sample."""
+    targets = area_at(plan, layer["tier"], layer["zooms"][0])
     if box:
         targets = [t for t in targets if tile_hits_box(*t, box)]
     if sample:
         targets = random.Random(seed).sample(targets, max(1, int(len(targets) * sample)))
+    return targets
+
+
+def render_layer(db, plan, layer, box, sample, seed, method, url, workers):
+    """Render missing tiles of a layer into db; returns (rendered, failed, bytes, seconds)."""
+    name, z = layer["name"], layer["zooms"][0]
+    targets = layer_targets(plan, layer, box, sample, seed)
+    if not box and not sample:  # the full layer: `status` reports progress against this
+        db.execute("INSERT OR REPLACE INTO targets VALUES (?, ?, ?)", (name, z, len(targets)))
+        db.commit()
     have = existing(db, z)
     urls = url.split(",")  # several renderers: spread tiles across them round-robin
     todo = [(z, x, y, urls[i % len(urls)], method)
@@ -987,8 +1202,16 @@ def cmd_fetch(args):
         sys.exit(1)
 
 
+def load_budget():
+    """The card budget `plan` wrote: card_free_bytes minus CARD_MARGIN."""
+    if not os.path.exists(BUDGET):
+        raise SystemExit("no %s: run `make plan`" % BUDGET)
+    return int(open(BUDGET).read())
+
+
 def cmd_report(args):
-    """Per-zoom rows against the plan, payload, failures. With --budget-bytes it is the fit gate."""
+    """Per-zoom rows against the plan, rendered bytes against the plan's estimate, payload, failures.
+    With --fit it is the fit gate (payload vs the card budget, rows vs the plan)."""
     plan = load_plan()
     db = sqlite3.connect(args.db)
     stored = {z: (n, b) for z, n, b in db.execute(
@@ -1006,17 +1229,24 @@ def cmd_report(args):
     payload, distinct = db.execute(
         "SELECT SUM(l), COUNT(*) FROM (SELECT MAX(length(tile_data)) AS l FROM tiles GROUP BY h)").fetchone()
     nfail = db.execute("SELECT COUNT(*) FROM failures").fetchone()[0]
+    # the size model predicts each rendered zoom's raw bytes: every build checks it
+    for layer in plan["layers"]:
+        z = layer["zooms"][0]
+        if layer["kind"] == "render" and layer["bytes"] and stored.get(z, (0, 0))[1]:
+            print("z%d rendered: plan estimated %.2f GB, stored %.2f GB (%+.1f%%)" % (
+                z, layer["bytes"] / 1e9, stored[z][1] / 1e9, 100 * (stored[z][1] / layer["bytes"] - 1)))
     print("\nrows %d, raw %.2f GB; distinct blobs %d, payload %.2f GB; failures %d" % (
         rows, total / 1e9, distinct, payload / 1e9, nfail))
     if differ:
         # after a complete fetch the database holds every planned tile, so equal counts mean equal sets
         print("rows differ from %s at z%s: the database is from another areas.toml, or a fetch is incomplete.\n"
-              "Start a new database: rm -f %s*; rm -f work/.bundles.done work/.renders.done work/.tiles.done"
+              "Start a new database: rm -f %s*; rm -f work/.size.ok work/.bundles.done work/.renders.done work/.tiles.done"
               % (PLAN, ",".join(map(str, differ)), args.db))
-    if args.budget_bytes is not None:
-        ok = payload <= args.budget_bytes and nfail == 0 and not differ
+    if args.fit:
+        budget = load_budget()
+        ok = payload <= budget and nfail == 0 and not differ
         print("fit check: payload %.2f GB vs budget %.2f GB, failures %d, rows %s the plan -> %s" % (
-            payload / 1e9, args.budget_bytes / 1e9, nfail, "differ from" if differ else "match", "OK" if ok else "FAIL"))
+            payload / 1e9, budget / 1e9, nfail, "differ from" if differ else "match", "OK" if ok else "FAIL"))
         sys.exit(0 if ok else 1)
 
 
@@ -1070,8 +1300,8 @@ def cmd_style(args):
         f.write("\n")
 
 
-STAMPS = [".preflight", ".plan", "osm/extract.osm.pbf", "vector/openmaptiles.mbtiles", ".renderer", ".parity.ok",
-          ".bundles.done", ".renders.done", ".tiles.done", ".fit.ok", "osm-bright.pmtiles", "verify.txt"]
+STAMPS = [".plan", ".preflight", "osm/extract.osm.pbf", "vector/openmaptiles.mbtiles", ".renderer", ".parity.ok",
+          ".size.ok", ".bundles.done", ".renders.done", ".tiles.done", ".fit.ok", "osm-bright.pmtiles", "verify.txt"]
 
 
 def cmd_status(args):
@@ -1090,7 +1320,7 @@ def cmd_status(args):
                            published[-1] if published else "not done (`make publish DEST=host:/path`)"))
     procs = subprocess.run(["ps", "-Ao", "etime=,command="], capture_output=True, text=True).stdout.splitlines()
     for p in procs:
-        if (("build.py" in p and " status" not in p and "uv run" not in p) or ("go-pmtiles" in p and "go install" not in p)
+        if (("build.py" in p and " status" not in p and "uv run" not in p) or "go-pmtiles" in p
                 or (len(p.split()) > 1 and p.split()[1] in ("rsync", "ssh") and "osm-bright" in p)):
             print("running: %s" % " ".join(p.split())[:140])
     # convert writes its temp file, then the archive; both grow towards the database payload
@@ -1245,39 +1475,121 @@ def cmd_parity(args):
     sys.exit(0 if ok else 1)
 
 
+def sample_fraction(layer, fraction):
+    """The fraction of a render layer to sample: `fraction`, but at least 100 tiles (all, if fewer), so
+    the standard error is meaningful for small layers."""
+    return min(1.0, max(fraction, 100 / layer["tiles"]))
+
+
+def sample_projection(db, plan, layer, fraction, seed):
+    """(projected bytes, standard error, sampled tiles) of a render layer, from its sample's stored tiles."""
+    z = layer["zooms"][0]
+    want = {(x, (1 << z) - 1 - y) for _, x, y in layer_targets(plan, layer, None, fraction, seed)}
+    sizes = [ln for x, r, ln in db.execute(
+        "SELECT tile_column, tile_row, length(tile_data) FROM tiles WHERE zoom_level = ?", (z,)) if (x, r) in want]
+    n, total = len(sizes), layer["tiles"]
+    if not n:  # every sample tile failed to render; the caller reports the failures
+        return 0.0, 0.0, 0
+    se = statistics.stdev(sizes) / math.sqrt(n) * math.sqrt(1 - n / total) if n > 1 else 0.0
+    return total * statistics.fmean(sizes), total * se, n
+
+
+def render_sample(db, plan, args, seed):
+    """Render each render layer's sample into db; lines and the projected (exact + rendered, standard error)."""
+    lines = ["layer                 tiles  sampled  failed  tiles/s  projected GB  plan estimate GB"]
+    projected, var, failed_all, rate = plan["size"]["exact"], 0.0, 0, []
+    for layer in plan["layers"]:
+        if layer["kind"] != "render":
+            continue
+        frac = sample_fraction(layer, args.sample)
+        done, failed, _, el = render_layer(db, plan, layer, None, frac, seed, args.quant, args.render_url, args.workers)
+        failed_all += failed
+        if done:
+            rate.append((done + failed, el))
+        proj, se, n = sample_projection(db, plan, layer, frac, seed)
+        projected += proj
+        var += se * se
+        lines.append("%-20s %7d %8d %7d %8s %13.2f %17s" % (
+            layer["name"], layer["tiles"], n, failed, "%.0f" % ((done + failed) / el) if done else "-",
+            proj / 1e9, "-" if layer["bytes"] is None else "%.2f" % (layer["bytes"] / 1e9)))
+    return lines, projected, math.sqrt(var), failed_all, rate
+
+
 def cmd_bench(args):
-    """Render a sample of each render layer locally into a scratch db: tiles/s, ETA, projected sizes."""
-    plan = load_plan()
+    """Render a sample of each render layer into a scratch db: tiles/s, ETA, projected size vs the card."""
+    plan, budget = load_plan(), load_budget()
     path = os.path.join(WORK, "bench.mbtiles")
     if os.path.exists(path):
         os.remove(path)
     db = open_db(path, plan)
-    lines = ["layer                 targets  sampled  failed   tiles/s   sample MB  projected GB"]
-    tiles = secs = failed_all = left = projected = 0
-    for layer in plan["layers"]:
-        if layer["kind"] != "render":
-            continue
-        n = layer["tiles"]
-        done, failed, nbytes, el = render_layer(db, plan, layer, None, args.sample, args.seed, args.quant,
-                                                args.render_url, args.workers)
-        tiles += done + failed
-        secs += el
-        failed_all += failed
-        left += n - done - failed
-        projected += nbytes / args.sample
-        lines.append("%-20s %8d %8d %7d %9.1f %11.1f %13.2f" % (
-            layer["name"], n, done, failed, (done + failed) / el, nbytes / 1e6, nbytes / args.sample / 1e9))
-    rate = tiles / secs
-    bundles = sum(l.get("bundle_bytes", 0) for l in plan["layers"])
-    lines += ["", "overall %.1f tiles/s with %d workers; full render of the remaining %d tiles: ~%.1f h" % (
-        rate, args.workers, left, left / rate / 3600),
-        "projected archive payload ~%.2f GB: bundles %.2f GB (plan) + rendered %.2f GB (this sample)" % (
-        (bundles + projected) / 1e9, bundles / 1e9, projected / 1e9)]
-    if args.budget_bytes:
-        lines.append("card budget %.2f GB: %s" % (args.budget_bytes / 1e9, "fits" if bundles + projected <= args.budget_bytes
-                                                    else "OVER by ~%.2f GB" % ((bundles + projected - args.budget_bytes) / 1e9)))
+    lines, projected, se, failed, rate = render_sample(db, plan, args, args.seed)
+    tiles_per_s = sum(n for n, _ in rate) / max(sum(el for _, el in rate), 1e-9)
+    left = sum(l["tiles"] for l in plan["layers"] if l["kind"] == "render")
+    lines += ["", "rendering %.0f tiles/s with %d workers: all %d rendered tiles take ~%.1f h" % (
+        tiles_per_s, args.workers, left, left / tiles_per_s / 3600),
+        "projected archive %.2f GB ±%.2f (95%%): %.2f GB bundles (exact) + rendered from the sample; card budget %.2f GB" % (
+        projected / 1e9, 1.96 * se / 1e9, plan["size"]["exact"] / 1e9, budget / 1e9)]
     write_report(os.path.join(WORK, "bench", "report.txt"), lines)
-    sys.exit(1 if failed_all else 0)
+    sys.exit(1 if failed else 0)
+
+
+def cmd_size_gate(args):
+    """Before the fetch: render a sample of each render layer into the real database (the fetch then skips
+    those tiles) and project the archive from it. Fails if even the low end of the projection (-1.96
+    standard errors) is over the card budget; a projection is raw bytes, so it errs high."""
+    plan, budget = load_plan(), load_budget()
+    db = open_db(args.db, plan)
+    lines, projected, se, failed, _ = render_sample(db, plan, args, args.seed)
+    if failed:
+        raise SystemExit("%d sample tiles failed to render: re-run" % failed)
+    low, high = projected - 1.96 * se, projected + 1.96 * se
+    v = "over" if low > budget else "fits" if high <= budget else "may not fit"
+    lines += ["", "projected archive %.2f-%.2f GB (95%%) vs card budget %.2f GB: %s" % (low / 1e9, high / 1e9, budget / 1e9, v),
+              "size gate: %s" % ("FAIL: make the tiers smaller (`make plan` shows what each zoom costs)" if v == "over"
+                                 else "OK" + (" (the fit gate after the fetch decides)" if v == "may not fit" else ""))]
+    write_report(os.path.join(WORK, "size", "report.txt"), lines)
+    sys.exit(1 if v == "over" else 0)
+
+
+def cmd_bundles(args):
+    """Oxed's bundles with their zoom range and size; --at lon,lat: only those whose bbox contains it."""
+    meta = json.loads(http_get(METADATA_URL))
+    if args.at:
+        lon, lat = (float(v) for v in args.at.split(","))
+        meta = [b for b in meta if boxes_overlap(b["bbox"], [lon, lat, lon, lat])]
+    print("%-11s %-24s %-7s %7s  %s" % ("group", "slug", "zooms", "GB", "bbox W, S, E, N"))
+    for b in sorted(meta, key=lambda b: (b["group"], b["maxZoom"], b["slug"])):
+        print("%-11s %-24s z%d-%-4d %7.2f  %s%s" % (
+            b["group"], b["slug"], b["minZoom"], b["maxZoom"], b["fileSizeBytes"] / 1e9, ", ".join("%.2f" % v for v in b["bbox"]),
+            "" if b["maxZoom"] >= 15 else "  (as a tier's deepest bundle: no size estimate past z%d)" % b["maxZoom"]))
+    print("\nA tier's `bundles` in %s takes slugs or groups." % AREAS)
+
+
+def cmd_preflight(args):
+    """Before any download: Docker is up with memory for Planetiler's heap, and the disk holds the
+    build's peak (from the plan's sizes and the extract's)."""
+    plan = load_plan()
+    r = subprocess.run(["docker", "info", "--format", "{{.MemTotal}}"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit("Docker is not running")
+    mem = int(r.stdout.strip())
+    if mem < args.heap_gb * 2 ** 30:
+        raise SystemExit("Docker has %.1f GiB of memory and Planetiler is given %d GiB (PLANETILER_HEAP_GB in the "
+                         "Makefile): give Docker more (Docker Desktop: Settings > Resources)" % (mem / 2 ** 30, args.heap_gb))
+    if not os.path.exists(EXTRACT_BYTES):
+        raise SystemExit("the extract's size is unknown (`make plan` couldn't reach it): re-run `make plan` online")
+    extract = int(open(EXTRACT_BYTES).read())
+    payload = plan["size"]["high"]
+    need = extract + max(PLANETILER_TEMP_PER_EXTRACT * extract, DISK_PER_PAYLOAD * payload) + 3e9  # 3 GB: sources, vector tiles
+    st = os.statvfs(WORK)
+    built = sum(os.path.getsize(p) for p in (os.path.join(WORK, "osm", "extract.osm.pbf"), DEFAULT_DB, DEFAULT_DB + "-wal",
+                                             os.path.join(WORK, "osm-bright.pmtiles")) if os.path.exists(p))
+    have = st.f_bavail * st.f_frsize + built
+    print("Docker memory %.1f GiB (Planetiler heap %d GiB); disk: need ~%.0f GB at the peak, have %.0f GB%s%s" % (
+        mem / 2 ** 30, args.heap_gb, need / 1e9, have / 1e9, " (counting %.0f GB already built)" % (built / 1e9) if built else "",
+        "; rendered size of %s unknown, not counted" % ", ".join(plan["size"]["unknown"]) if plan["size"]["unknown"] else ""))
+    if have < need:
+        raise SystemExit("not enough disk for this build: free ~%.0f GB more" % ((need - have) / 1e9))
 
 
 def pmtiles_tile(archive, z, x, y):
@@ -1424,16 +1736,19 @@ def main():
     s = sub.add_parser("pin")
     s.add_argument("--force", action="store_true")
     sub.add_parser("plan")
-    for name in ("fetch", "bench"):
+    s = sub.add_parser("bundles")
+    s.add_argument("--at", metavar="LON,LAT", help="only bundles whose bbox contains this point")
+    s = sub.add_parser("preflight")
+    s.add_argument("--heap-gb", type=int, required=True, help="Planetiler's Java heap")
+    for name in ("fetch", "bench", "size-gate"):
         s = sub.add_parser(name)
         if name == "fetch":
-            s.add_argument("--db", default=DEFAULT_DB)
             s.add_argument("--kind", choices=["bundle", "render"], help="only this kind of layer")
             s.add_argument("--layers", nargs="+", help="only these layers (names from `plan`)")
             s.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"), help="restrict every layer (pilot)")
-        else:
-            s.add_argument("--budget-bytes", type=int)
-        s.add_argument("--sample", type=float, default=None if name == "fetch" else 0.01,
+        if name != "bench":
+            s.add_argument("--db", default=DEFAULT_DB)
+        s.add_argument("--sample", type=float, default=None if name == "fetch" else SAMPLE,
                        help="render only this fraction of each render layer")
         s.add_argument("--seed", type=int, default=1)
         s.add_argument("--quant", choices=["mediancut", "fastoctree"], default="mediancut")
@@ -1441,7 +1756,7 @@ def main():
         s.add_argument("--workers", type=int, default=16)
     s = sub.add_parser("report")
     s.add_argument("--db", default=DEFAULT_DB)
-    s.add_argument("--budget-bytes", type=int)
+    s.add_argument("--fit", action="store_true", help="the fit gate: exit 1 unless payload <= the card budget")
     s = sub.add_parser("calibrate")
     s.add_argument("--n", type=int, default=40)
     s.add_argument("--seed", type=int, default=1)
@@ -1465,7 +1780,8 @@ def main():
         s.add_argument(opt, required=True)
     args = p.parse_args()
     os.makedirs(WORK, exist_ok=True)
-    {"pin": cmd_pin, "plan": cmd_plan, "fetch": cmd_fetch, "report": cmd_report, "calibrate": cmd_calibrate,
+    {"pin": cmd_pin, "plan": cmd_plan, "bundles": cmd_bundles, "preflight": cmd_preflight, "size-gate": cmd_size_gate,
+     "fetch": cmd_fetch, "report": cmd_report, "calibrate": cmd_calibrate,
      "style": cmd_style, "seal": cmd_seal, "initdb": cmd_initdb, "status": cmd_status,
      "parity": cmd_parity, "bench": cmd_bench, "verify": cmd_verify, "card": cmd_card,
      "manifest": cmd_manifest}[args.cmd](args)

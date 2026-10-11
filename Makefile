@@ -1,59 +1,72 @@
 # Repeatable build of the T-Deck map card archive from the nested map areas in areas.toml.
 #
+#   make plan                         what areas.toml derives to: sizes vs the card, what one zoom
+#                                     deeper/shallower costs, extract, bounds, probes (no tiles fetched)
+#   make bundles [AT=lon,lat]         Oxed's bundles, for a tier's `bundles`
+#   make bench                        measure render speed and size from a 1% sample (scratch database)
 #   make                              build and verify work/osm-bright.pmtiles
-#   make plan                         what areas.toml derives to: layers, tile counts, bounds, probes
 #   make card CARD=/Volumes/MESHMAP   copy it to a mounted exFAT card (full read-back check)
-#   make parity | make bench          renderer checks (parity must pass before tiles are fetched)
 #   make renderer-down                stop the local renderer
 #
 # Design and measurements: docs/DESIGN.md. Written for macOS's GNU Make 3.81.
 
 PY := uv run --quiet build.py
 PMTILES := work/bin/go-pmtiles
-GO_PMTILES_VERSION := v1.31.2
+# go-pmtiles release binaries and their sha256 (from the GitHub release's asset digests)
+GO_PMTILES_VERSION := 1.31.2
+GO_PMTILES_SHA256_arm64 := 40528f7f616fcbf91207cd48c8fc023d213f6d86c0cbf1f748732803d1880f3d
+GO_PMTILES_SHA256_x86_64 := 1f0dc02eee6c58312dd6c509faee1b5c32f0596568af1bf51f1b034e7a88a65b
+ARCH := $(shell uname -m)
 
 PLANETILER_IMAGE := ghcr.io/onthegomap/planetiler:0.10.2@sha256:cf32202dbc001a9ab4bc11534b642b13de3798179817da8558e567a3d13dd403
 TILESERVER_IMAGE := $(shell sed -n 's/^ *image: *//p' docker-compose.yml)
 FONTS_URL := https://github.com/openmaptiles/fonts/releases/download/v2.0/noto-sans.zip
 FONTS_SHA256 := d117316544b43a5dde7ee761b36e17701e9f85574e181d76a74814240fdbaf34
-# the formatted 64 GB card's free space (63,983,058,944 B on 2026-10-10) minus a 0.5 GB margin
-BUDGET_BYTES := 63483058944
-# peak use was ~190 GB for a 57 GB archive (extract, MBTiles, convert temp and master side by side)
-MIN_FREE_KB := 195312500
+# Planetiler's Java heap; preflight checks Docker has at least this much memory
+PLANETILER_HEAP_GB := 8
 WORKERS ?= 16
 # the two renderers in docker-compose.yml
 RENDER_URLS := http://127.0.0.1:8080/styles/osm-bright/{z}/{x}/{y}.png,http://127.0.0.1:8081/styles/osm-bright/{z}/{x}/{y}.png
 
 .DELETE_ON_ERROR:
-.PHONY: all plan renderer renderer-down parity bench card status publish
+.PHONY: all plan bundles renderer renderer-down parity bench card status publish
 
 all: work/verify.txt
 
 # ---- preconditions and tools
 
-work/.preflight:
-	@docker info >/dev/null 2>&1 || { echo "Docker is not running"; exit 1; }
-	@free=$$(df -k . | awk 'NR==2 {print $$4}'); test "$$free" -ge $(MIN_FREE_KB) || \
-	  { echo "need ~200 GB free on this disk, have $$((free / 1000000)) GB"; exit 1; }
-	@mkdir -p work && touch $@
+# Docker running with memory for Planetiler, and disk for this plan's peak; go-pmtiles fetched up front
+work/.preflight: work/plan/plan.json work/plan/extract-bytes.txt $(PMTILES)
+	$(PY) preflight --heap-gb $(PLANETILER_HEAP_GB)
+	touch $@
 
 $(PMTILES):
-	GOBIN=$(CURDIR)/work/bin go install github.com/protomaps/go-pmtiles@$(GO_PMTILES_VERSION)
+	mkdir -p work/bin work/cache
+	curl -fsSL -o work/cache/go-pmtiles.zip \
+	  https://github.com/protomaps/go-pmtiles/releases/download/v$(GO_PMTILES_VERSION)/go-pmtiles-$(GO_PMTILES_VERSION)_Darwin_$(ARCH).zip
+	test "$$(shasum -a 256 work/cache/go-pmtiles.zip | cut -d' ' -f1)" = "$(GO_PMTILES_SHA256_$(ARCH))" || \
+	  { echo "go-pmtiles download: sha256 mismatch (or no release for $(ARCH))"; exit 1; }
+	unzip -qo work/cache/go-pmtiles.zip pmtiles -d work/bin
+	mv work/bin/pmtiles $@
 
-work/bundles.json:
+bundles:
+	@$(PY) bundles $(if $(AT),--at=$(AT))
+
+# ---- the plan: areas.toml -> layers, sizes, extract, Planetiler bounds, probes. `pin` pins bundles
+# areas.toml names for the first time. `plan` rewrites a file in work/plan/ only when its contents
+# change, so only what depends on that file is rebuilt (a probe edit re-runs `verify`; new bounds re-run
+# Planetiler; a new card re-runs the size gates).
+
+work/.plan: areas.toml $(wildcard work/bundles.json)
 	$(PY) pin
-
-# ---- the plan: areas.toml -> layers, tile counts, Planetiler bounds, probes. `plan` rewrites a file in
-# work/plan/ only when its contents change, so only what depends on that file is rebuilt (a probe
-# edit re-runs `verify`; new bounds re-run Planetiler).
-
-work/.plan: areas.toml work/bundles.json
 	$(PY) plan
 	touch $@
 
-work/plan/plan.json work/plan/probes.json work/plan/bounds.txt work/plan/osm-url.txt: work/.plan ;
+work/plan/plan.json work/plan/probes.json work/plan/bounds.txt work/plan/osm-url.txt \
+  work/plan/budget.txt work/plan/extract-bytes.txt: work/.plan ;
 
-plan: work/bundles.json
+plan:
+	$(PY) pin
 	$(PY) plan
 	touch work/.plan
 
@@ -71,7 +84,7 @@ work/osm/extract.osm.pbf: work/plan/osm-url.txt | work/.preflight
 
 work/vector/openmaptiles.mbtiles: work/osm/extract.osm.pbf work/plan/bounds.txt
 	mkdir -p work/planetiler work/vector
-	docker run --rm -e JAVA_TOOL_OPTIONS=-Xmx8g \
+	docker run --rm -e JAVA_TOOL_OPTIONS=-Xmx$(PLANETILER_HEAP_GB)g \
 	  -v "$(CURDIR)/work/planetiler:/data" -v "$(CURDIR)/work/osm:/osm:ro" \
 	  $(PLANETILER_IMAGE) --osm-path=/osm/extract.osm.pbf --download --maxzoom=15 --bounds=$$(cat work/plan/bounds.txt) \
 	  --output=/data/openmaptiles.mbtiles --force
@@ -120,15 +133,21 @@ work/.parity.ok: work/.renderer work/plan/plan.json
 
 parity: work/.parity.ok
 
-bench: renderer work/plan/plan.json
-	$(PY) bench --workers $(WORKERS) --budget-bytes $(BUDGET_BYTES)
+bench: renderer work/plan/plan.json work/plan/budget.txt
+	$(PY) bench --workers $(WORKERS) --render-url '$(RENDER_URLS)'
+
+# size gate: a 1% render sample into the real database (the fetch skips those tiles) projects the
+# archive; fails if it is clearly over the card, before the hours of fetching
+work/.size.ok: work/.parity.ok work/plan/plan.json work/plan/budget.txt | renderer
+	$(PY) initdb
+	$(PY) size-gate --workers $(WORKERS) --render-url '$(RENDER_URLS)'
+	touch $@
 
 # bundle download (network-bound) and local rendering (CPU-bound) overlap: ~36 min and ~53 min
 # measured separately, instead of ~2 h one after the other. Both write work/tiles.mbtiles (WAL).
-work/.tiles.done: work/.parity.ok work/plan/plan.json
+work/.tiles.done: work/.size.ok work/plan/plan.json
 	$(PY) manifest --planetiler-image $(PLANETILER_IMAGE) --tileserver-image $(TILESERVER_IMAGE) \
 	  --fonts-url $(FONTS_URL) --fonts-sha256 $(FONTS_SHA256) --go-pmtiles $(GO_PMTILES_VERSION)
-	$(PY) initdb
 	$(MAKE) -j2 work/.bundles.done work/.renders.done
 	touch $@
 
@@ -140,8 +159,8 @@ work/.renders.done: work/.parity.ok work/plan/plan.json | renderer
 	$(PY) fetch --kind render --workers $(WORKERS) --render-url '$(RENDER_URLS)'
 	touch $@
 
-work/.fit.ok: work/.tiles.done
-	$(PY) report --budget-bytes $(BUDGET_BYTES)
+work/.fit.ok: work/.tiles.done work/plan/budget.txt
+	$(PY) report --fit
 	touch $@
 
 # ---- archive
@@ -177,7 +196,8 @@ publish: work/verify.txt work/osm-bright.pmtiles.sha256
 	rsync -a --mkpath work/build-manifest.json work/verify.txt work/bundles.json work/fetch.log \
 	  work/plan/plan.json work/plan/probes.json $(DEST)/build/
 	rsync -a --mkpath work/parity/report.txt work/parity/sheet.png $(DEST)/build/parity/
-	rsync -a --mkpath work/bench/report.txt $(DEST)/build/bench/
+	rsync -a --mkpath work/size/report.txt $(DEST)/build/size/
+	test ! -f work/bench/report.txt || rsync -a --mkpath work/bench/report.txt $(DEST)/build/bench/
 	test ! -f work/card.log || rsync -a work/card.log $(DEST)/build/
 	@echo "verifying the copy on $(PUBLISH_HOST) (reads it back there) ..."
 	test "$$(ssh $(PUBLISH_HOST) sha256sum $(PUBLISH_PATH)/osm-bright.pmtiles | cut -d' ' -f1)" = \
