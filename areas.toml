@@ -1,0 +1,45 @@
+# The map areas in the archive: nested tiers, innermost first.
+#
+# Each tier is drawn from (the next tier's max_zoom + 1) up to its own max_zoom; the last tier starts
+# at z0. A tier's area is one of:
+#   bundles = [...]       Oxed bundle slugs or groups (https://bundle.tiles.coalition.space/metadata.json)
+#   bbox = [W, S, E, N]   the next tier's base tiles (its deepest bundle zoom: z15 for states and
+#                         countries) whose centre is inside the box
+# Zoom levels the tier's bundles reach are read from them; deeper ones are rendered locally.
+#
+# `make plan` shows what this derives to (layers, tile counts, Planetiler bounds, probes) without
+# fetching any tiles. Changing a tier means starting a new tile database (README, "Changing the map areas").
+
+# OpenStreetMap extract for the local renderer: must contain the whole of every rendered tile, including
+# the parts of border tiles in neighbouring areas (`plan` checks this against a Geofabrik extract's .poly)
+osm_extract = "https://download.geofabrik.de/north-america/us-latest.osm.pbf"
+
+# places `verify` checks in the finished archive: present at `zoom`, missing at zoom + 1.
+# `plan` checks them against the derived tiles first, and adds one sampled point per tier.
+probes = [
+  { name = "Denver", lon = -104.9903, lat = 39.7392, zoom = 15 },
+  { name = "Anchorage", lon = -149.9003, lat = 61.2181, zoom = 13 },  # Alaska has no state bundle
+  { name = "Springfield IL", lon = -89.6501, lat = 39.7817, zoom = 16 },
+  { name = "Naperville", lon = -88.1535, lat = 41.7508, zoom = 18 },
+  { name = "the Loop", lon = -87.6298, lat = 41.8781, zoom = 18 },
+]
+
+[[tier]]
+name = "chicago-metro"  # CMAP's 7 counties; the box is clipped to Illinois by the tier around it
+max_zoom = 18
+bbox = [-88.94, 41.20, -87.52, 42.50]
+
+[[tier]]
+name = "illinois"
+max_zoom = 16
+bundles = ["illinois"]
+
+[[tier]]
+name = "us"
+max_zoom = 15
+bundles = ["us-state"]  # all-united-states (to z13) and 49 state bundles (to z15; none for Alaska)
+
+[[tier]]
+name = "world"
+max_zoom = 9
+bundles = ["world"]

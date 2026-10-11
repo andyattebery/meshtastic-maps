@@ -21,8 +21,8 @@
     }
   },
   "data": {
-    "illinois": {
-      "mbtiles": "illinois.mbtiles"
+    "openmaptiles": {
+      "mbtiles": "openmaptiles.mbtiles"
     }
   }
 }

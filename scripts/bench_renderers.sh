@@ -4,9 +4,10 @@
 #   scripts/bench_renderers.sh N [tiles_per_renderer_fraction]
 #
 # Starts N TileServer GL containers (image pinned in docker-compose.yml) on 127.0.0.1:18080..,
-# runs one `build.py fetch` per container on a fixed metro z18 sample (0.4% = 4,975 tiles each,
-# seeds 101..), prints the combined tiles/s, then removes the containers and scratch databases.
-# Needs: render/, work/render/fonts/, work/vector/illinois.mbtiles, work/bundles.json, uv, docker.
+# runs one `build.py fetch` per container on a fixed sample of the plan's deepest render layer
+# (0.4% each; 4,975 tiles for this build's chicago-metro-z18; seeds 101..), prints the combined tiles/s,
+# then removes the containers and scratch databases.
+# Needs: render/, work/render/fonts/, work/vector/openmaptiles.mbtiles, work/plan/plan.json, uv, docker.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -34,9 +35,10 @@ for i in $(seq 0 $((n - 1))); do
 done
 
 rm -f work/bench-r*.mbtiles
+layer=$(python3 -c 'import json; print([l["name"] for l in json.load(open("work/plan/plan.json"))["layers"] if l["kind"] == "render"][-1])')
 pids=()
 for i in $(seq 0 $((n - 1))); do
-  uv run --quiet build.py fetch --db "work/bench-r$i.mbtiles" --layers metro18 --sample "$sample" \
+  uv run --quiet build.py fetch --db "work/bench-r$i.mbtiles" --layers "$layer" --sample "$sample" \
     --seed $((101 + i)) --workers 16 \
     --render-url "http://127.0.0.1:$((18080 + i))/styles/osm-bright/{z}/{x}/{y}.png" \
     > "work/bench-r$i.log" 2>&1 &

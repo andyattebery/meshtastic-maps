@@ -1,5 +1,5 @@
 # Local raster renderers: the same TileServer GL version Oxed's tile server runs (v5.6.0),
-# drawing Oxed's osm-bright style from vector tiles built by `make vector`.
+# drawing Oxed's osm-bright style from the vector tiles Planetiler builds (work/vector/).
 # Two instances: one process saturates at ~2 cores; two reach ~710 tiles/s on the M4 Pro and
 # leave the CPU nearly full (scripts/bench_renderers.sh, 2026-10-10).
 x-tileserver: &tileserver
